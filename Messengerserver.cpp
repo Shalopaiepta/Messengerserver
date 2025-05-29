@@ -5,12 +5,13 @@
 #include <map>
 #include <mutex>
 #include <sstream>
-#include <fstream>   // Для работы с файлами
-#include <algorithm> // Для std::transform, std::remove
-#include <chrono>    // Для std::chrono
-#include <iomanip>   // Для std::put_time, std::get_time
-#include <filesystem>// Для std::filesystem (C++17)
+#include <fstream>
+#include <algorithm>
+#include <chrono>
+#include <iomanip>
+#include <filesystem> // Для std::filesystem (C++17)
 #include <cctype>    // для ::toupper
+#include <set>       // Для std::set в GET_CHAT_PARTNERS
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -23,7 +24,7 @@
 #include <unistd.h>
 #include <errno.h> 
 #include <string.h> 
-#include <sys/stat.h> // Для mkdir в Unix, если filesystem не используется
+#include <sys/stat.h>
 #endif
 
 // Кросс-платформенные определения
@@ -111,6 +112,7 @@ bool loadCredentialsFromFile() {
     }
 
     LOG_SERVER_MSG("Loading credentials from '" + G_credentialsFileName + "'...");
+    // G_credentialsMutex будет взят в initUserStore
     G_usersCredentials.clear();
     std::string line;
     int count = 0;
@@ -118,9 +120,9 @@ bool loadCredentialsFromFile() {
         std::istringstream iss(line);
         std::string username, password;
         if (std::getline(iss, username, ':') && std::getline(iss, password)) {
-            if (!password.empty() && password.back() == '\r') {
-                password.pop_back();
-            }
+            if (!username.empty() && username.back() == '\r') username.pop_back();
+            if (!password.empty() && password.back() == '\r') password.pop_back();
+
             G_usersCredentials[username] = password;
             count++;
         }
@@ -150,13 +152,27 @@ std::string serverReadLine(SocketType socket) {
     while (true) {
         int bytesReceived = recv(socket, &ch, 1, 0);
         if (bytesReceived == 0) {
-            LOG_MSG(socket, "Client disconnected gracefully.");
+            LOG_MSG(socket, "Client disconnected gracefully during read.");
             return "";
         }
         if (bytesReceived < 0) {
             int error_code = GET_LAST_ERROR;
             std::string error_str = GET_LAST_ERROR_STR;
-            LOG_MSG(socket, "recv failed with error: " + std::to_string(error_code) + " (" + error_str + ")");
+#ifdef _WIN32
+            if (error_code == WSAECONNRESET || error_code == WSAESHUTDOWN || error_code == WSAETIMEDOUT) {
+                LOG_MSG(socket, "recv failed with graceful disconnect or timeout: " + std::to_string(error_code) + " (" + error_str + ")");
+            }
+            else {
+                LOG_MSG(socket, "recv failed with error: " + std::to_string(error_code) + " (" + error_str + ")");
+            }
+#else
+            if (error_code == ECONNRESET || error_code == EPIPE || error_code == ETIMEDOUT) {
+                LOG_MSG(socket, "recv failed with graceful disconnect or timeout: " + std::to_string(error_code) + " (" + error_str + ")");
+            }
+            else {
+                LOG_MSG(socket, "recv failed with error: " + std::to_string(error_code) + " (" + error_str + ")");
+            }
+#endif
             return "";
         }
         if (ch == '\n') {
@@ -173,68 +189,52 @@ std::string serverReadLine(SocketType socket) {
 void serverSendMessage(SocketType socket, const std::string& message) {
     std::string msg = message + "\n";
     int msg_len = static_cast<int>(msg.length());
-    int bytesSent = send(socket, msg.c_str(), msg_len, 0);
-
-    if (bytesSent == SOCKET_ERROR_VALUE) {
-        LOG_MSG(socket, "Send failed with error: " + std::string(GET_LAST_ERROR_STR) + " for message: \"" + message + "\"");
+    int bytesSentTotal = 0;
+    while (bytesSentTotal < msg_len) {
+        int bytesSent = send(socket, msg.c_str() + bytesSentTotal, msg_len - bytesSentTotal, 0);
+        if (bytesSent == SOCKET_ERROR_VALUE) {
+            LOG_MSG(socket, "Send failed with error: " + std::string(GET_LAST_ERROR_STR) + " for message: \"" + message + "\"");
+            return;
+        }
+        bytesSentTotal += bytesSent;
     }
-    else if (bytesSent < msg_len) {
-        LOG_MSG(socket, "Send sent only " + std::to_string(bytesSent) + "/" + std::to_string(msg_len) + " bytes for message: \"" + message + "\"");
-    }
-    else {
-        LOG_MSG(socket, "Sent: \"" + message + "\" (" + std::to_string(bytesSent) + " bytes)");
-    }
+    LOG_MSG(socket, "Sent: \"" + message + "\" (" + std::to_string(bytesSentTotal) + " bytes)");
 }
 
 bool userExists(SocketType s, const std::string& username) {
-    LOG_MSG(s, "userExists: Checking for user '" + username + "' in memory map.");
     std::lock_guard<std::mutex> lock(G_credentialsMutex);
-    // LOG_MSG(s, "userExists: Acquired G_credentialsMutex for '" + username + "'"); // Слишком много логов, убрал
-    bool exists = G_usersCredentials.count(username) > 0;
-    // LOG_MSG(s, "userExists: User '" + username + (exists ? "' exists." : "' does not exist.") + " Releasing G_credentialsMutex."); // Слишком много логов
-    return exists;
+    return G_usersCredentials.count(username) > 0;
 }
 
 bool verifyUser(SocketType s, const std::string& username, const std::string& password) {
-    LOG_MSG(s, "verifyUser: Verifying user '" + username + "' from memory map.");
     std::lock_guard<std::mutex> lock(G_credentialsMutex);
-    // LOG_MSG(s, "verifyUser: Acquired G_credentialsMutex for '" + username + "'");
     auto it = G_usersCredentials.find(username);
-    bool ok = false;
     if (it != G_usersCredentials.end()) {
-        ok = (it->second == password);
+        return (it->second == password);
     }
-    // LOG_MSG(s, "verifyUser: User '" + username + (ok ? "' verified." : "' verification failed.") + " Releasing G_credentialsMutex.");
-    return ok;
+    return false;
 }
 
 bool insertUser(SocketType s, const std::string& username, const std::string& password) {
-    LOG_MSG(s, "insertUser: Attempting to insert user '" + username + "'");
     std::lock_guard<std::mutex> lock(G_credentialsMutex);
-    LOG_MSG(s, "insertUser: Acquired G_credentialsMutex for '" + username + "'");
-
     if (G_usersCredentials.count(username)) {
-        LOG_MSG(s, "insertUser: User '" + username + "' already exists in memory map. Insertion failed. Releasing G_credentialsMutex.");
         return false;
     }
 
     std::ofstream outFile(G_credentialsFileName, std::ios::app);
     if (!outFile.is_open()) {
-        LOG_MSG(s, "insertUser: CRITICAL - Failed to open credentials file '" + G_credentialsFileName + "' for writing! Releasing G_credentialsMutex.");
+        LOG_SERVER_MSG("CRITICAL - Failed to open credentials file '" + G_credentialsFileName + "' for writing!");
         return false;
     }
-
     outFile << username << ":" << password << std::endl;
     if (!outFile.good()) {
-        LOG_MSG(s, "insertUser: CRITICAL - Failed to write to credentials file '" + G_credentialsFileName + "'! Releasing G_credentialsMutex.");
+        LOG_SERVER_MSG("CRITICAL - Failed to write to credentials file '" + G_credentialsFileName + "'!");
         outFile.close();
         return false;
     }
     outFile.close();
-    LOG_MSG(s, "insertUser: User '" + username + "' successfully written to file '" + G_credentialsFileName + "'.");
-
     G_usersCredentials[username] = password;
-    LOG_MSG(s, "insertUser: User '" + username + "' inserted into memory map. Map size: " + std::to_string(G_usersCredentials.size()) + ". Releasing G_credentialsMutex.");
+    LOG_SERVER_MSG("User '" + username + "' successfully registered.");
     return true;
 }
 
@@ -242,24 +242,28 @@ std::string getChatFilename(const std::string& user1, const std::string& user2) 
     if (user1 < user2) {
         return G_chatLogsDir + "chat_" + user1 + "_" + user2 + ".txt";
     }
-    else {
-        return G_chatLogsDir + "chat_" + user2 + "_" + user1 + ".txt";
-    }
+    return G_chatLogsDir + "chat_" + user2 + "_" + user1 + ".txt";
 }
 
 std::string getCurrentTimestamp() {
     auto now = std::chrono::system_clock::now();
     auto in_time_t = std::chrono::system_clock::to_time_t(now);
+    std::tm buf;
+#ifdef _WIN32
+    localtime_s(&buf, &in_time_t);
+#else
+    localtime_r(&in_time_t, &buf);
+#endif
     std::stringstream ss;
-    ss << std::put_time(std::localtime(&in_time_t), "%Y-%m-%d %H:%M:%S");
+    ss << std::put_time(&buf, "%Y-%m-%d %H:%M:%S");
     return ss.str();
 }
 
 
 void handleClient(SocketType clientSocket) {
     LOG_MSG(clientSocket, "New client handler started.");
-    std::string currentUsername;
-    bool loggedIn = false;
+    std::string currentUsername_local;
+    bool loggedIn_local = false;
 
     try {
         while (true) {
@@ -271,231 +275,239 @@ void handleClient(SocketType clientSocket) {
             std::istringstream iss(command_line);
             std::string cmd_token_from_client;
             iss >> cmd_token_from_client;
-
             std::string cmd_token_upper = cmd_token_from_client;
             std::transform(cmd_token_upper.begin(), cmd_token_upper.end(), cmd_token_upper.begin(),
                 [](unsigned char c) { return std::toupper(c); });
-            LOG_MSG(clientSocket, "Parsed command token (UPPER): '" + cmd_token_upper + "' from original: '" + cmd_token_from_client + "'");
 
+            LOG_MSG(clientSocket, "Parsed command: '" + cmd_token_upper + "'");
 
-            if (!loggedIn) {
+            if (!loggedIn_local) {
                 if (cmd_token_upper == "LOGIN") {
                     std::string tempUsername, password;
                     iss >> tempUsername >> password;
-                    LOG_MSG(clientSocket, "LOGIN attempt: User='" + tempUsername + "', Pass='***'"); // Пароль не логируем
                     if (!tempUsername.empty() && !password.empty()) {
                         if (verifyUser(clientSocket, tempUsername, password)) {
-                            LOG_MSG(clientSocket, "LOGIN: verifyUser successful for '" + tempUsername + "'. Acquiring G_usersMutex.");
                             std::lock_guard<std::mutex> lock(G_usersMutex);
-                            LOG_MSG(clientSocket, "LOGIN: Acquired G_usersMutex for '" + tempUsername + "'. Checking if connected.");
                             if (G_connectedUsers.find(tempUsername) == G_connectedUsers.end()) {
                                 G_connectedUsers[tempUsername] = clientSocket;
-                                currentUsername = tempUsername;
-                                loggedIn = true;
-                                LOG_MSG(clientSocket, "User '" + currentUsername + "' logged in.");
+                                currentUsername_local = tempUsername;
+                                loggedIn_local = true;
+                                LOG_MSG(clientSocket, "User '" + currentUsername_local + "' logged in.");
                                 { std::lock_guard<std::mutex> log_lock(G_logMutex); logConnectedUsersInternal(); }
-                                serverSendMessage(clientSocket, "OK_LOGIN Welcome, " + currentUsername + "!");
+                                serverSendMessage(clientSocket, "OK_LOGIN Welcome, " + currentUsername_local + "!");
                             }
                             else {
-                                LOG_MSG(clientSocket, "LOGIN: User '" + tempUsername + "' already logged in elsewhere.");
-                                serverSendMessage(clientSocket, "ERROR_LOGIN User already logged in elsewhere.");
+                                serverSendMessage(clientSocket, "ERROR_LOGIN User '" + tempUsername + "' already logged in elsewhere.");
                             }
-                            // LOG_MSG(clientSocket, "LOGIN: Releasing G_usersMutex for '" + tempUsername + "'."); // RAII сделает это
                         }
                         else {
-                            LOG_MSG(clientSocket, "LOGIN: Invalid username or password for '" + tempUsername + "'.");
                             serverSendMessage(clientSocket, "ERROR_LOGIN Invalid username or password.");
                         }
                     }
                     else {
-                        LOG_MSG(clientSocket, "LOGIN: Invalid format.");
-                        serverSendMessage(clientSocket, "ERROR_CMD Invalid login format. Usage: LOGIN <username> <password>");
+                        serverSendMessage(clientSocket, "ERROR_CMD Invalid login format.");
                     }
                 }
                 else if (cmd_token_upper == "REGISTRATION") {
                     std::string tempUsername, password;
                     iss >> tempUsername >> password;
-                    LOG_MSG(clientSocket, "REGISTRATION attempt: User='" + tempUsername + "', Pass='***'");
                     if (!tempUsername.empty() && !password.empty()) {
-                        LOG_MSG(clientSocket, "REGISTRATION: Calling userExists for '" + tempUsername + "'.");
                         if (!userExists(clientSocket, tempUsername)) {
-                            LOG_MSG(clientSocket, "REGISTRATION: User '" + tempUsername + "' does not exist. Calling insertUser.");
                             if (insertUser(clientSocket, tempUsername, password)) {
-                                LOG_MSG(clientSocket, "REGISTRATION: insertUser successful for '" + tempUsername + "'. Acquiring G_usersMutex for auto-login.");
                                 std::lock_guard<std::mutex> lock(G_usersMutex);
-                                LOG_MSG(clientSocket, "REGISTRATION: Acquired G_usersMutex for '" + tempUsername + "'.");
                                 G_connectedUsers[tempUsername] = clientSocket;
-                                currentUsername = tempUsername;
-                                loggedIn = true;
-                                LOG_MSG(clientSocket, "User '" + currentUsername + "' registered and logged in.");
+                                currentUsername_local = tempUsername;
+                                loggedIn_local = true;
+                                LOG_MSG(clientSocket, "User '" + currentUsername_local + "' registered and logged in.");
                                 { std::lock_guard<std::mutex> log_lock(G_logMutex); logConnectedUsersInternal(); }
-                                serverSendMessage(clientSocket, "OK_REGISTERED Welcome, " + currentUsername + "!");
-                                // LOG_MSG(clientSocket, "REGISTRATION: Releasing G_usersMutex for '" + tempUsername + "'.");
+                                serverSendMessage(clientSocket, "OK_REGISTERED Welcome, " + currentUsername_local + "!");
                             }
                             else {
-                                LOG_MSG(clientSocket, "REGISTRATION: insertUser failed for '" + tempUsername + "'.");
-                                serverSendMessage(clientSocket, "ERROR_REGISTRATION Registration failed (server error).");
+                                serverSendMessage(clientSocket, "ERROR_REGISTRATION Server error during registration.");
                             }
                         }
                         else {
-                            LOG_MSG(clientSocket, "REGISTRATION: User '" + tempUsername + "' already exists.");
-                            serverSendMessage(clientSocket, "ERROR_REGISTRATION User already exists.");
+                            serverSendMessage(clientSocket, "ERROR_REGISTRATION User '" + tempUsername + "' already exists.");
                         }
                     }
                     else {
-                        LOG_MSG(clientSocket, "REGISTRATION: Invalid format.");
-                        serverSendMessage(clientSocket, "ERROR_CMD Invalid registration format. Usage: REGISTRATION <username> <password>");
+                        serverSendMessage(clientSocket, "ERROR_CMD Invalid registration format.");
                     }
                 }
                 else {
-                    std::string rest_of_command;
-                    std::getline(iss, rest_of_command); // Считать остаток, чтобы лог был полным
-                    LOG_MSG(clientSocket, "Command '" + cmd_token_from_client + rest_of_command + "' received before login/registration.");
-                    serverSendMessage(clientSocket, "ERROR_AUTH Please login or register. Commands: LOGIN, REGISTRATION, HELP, EXIT");
+                    serverSendMessage(clientSocket, "ERROR_AUTH Please login or register.");
                 }
             }
-            else { // User is loggedIn
-                if (cmd_token_upper == "SEND_PRIVATE") {
-                    std::string recipient_from_stream;
-                    iss >> recipient_from_stream;
+            else {
+                if (cmd_token_upper == "LOGOUT") {
+                    LOG_MSG(clientSocket, "LOGOUT command received for user '" + currentUsername_local + "'.");
+                    {
+                        std::lock_guard<std::mutex> lock(G_usersMutex);
+                        auto it = G_connectedUsers.find(currentUsername_local);
+                        if (it != G_connectedUsers.end() && it->second == clientSocket) {
+                            G_connectedUsers.erase(it);
+                            LOG_MSG(clientSocket, "User '" + currentUsername_local + "' removed from connected users due to LOGOUT.");
+                            { std::lock_guard<std::mutex> log_lock(G_logMutex); logConnectedUsersInternal(); }
+                        }
+                    }
+                    serverSendMessage(clientSocket, "OK_LOGOUT Goodbye, " + currentUsername_local + "!");
+                    loggedIn_local = false;
+                    // currentUsername_local is not cleared here intentionally, for the final cleanup block
+                    break;
+                }
+                else if (cmd_token_upper == "SEND_PRIVATE") {
+                    std::string recipient, message_content;
+                    iss >> recipient;
                     iss >> std::ws;
-                    std::string message_content_from_stream;
-                    std::getline(iss, message_content_from_stream);
-
-                    LOG_MSG(clientSocket, "SEND_PRIVATE Raw Parse: Recipient='" + recipient_from_stream + "', MessageContentRaw='" + message_content_from_stream + "'");
-
-                    std::string recipient = recipient_from_stream;
-                    std::string message_content = message_content_from_stream;
-
-                    LOG_MSG(clientSocket, "SEND_PRIVATE Final Check: Recipient='" + recipient + "', MessageContent='" + message_content + "'");
+                    std::getline(iss, message_content);
 
                     if (recipient.empty() || message_content.empty()) {
-                        LOG_MSG(clientSocket, "SEND_PRIVATE: Invalid format - recipient or message is empty.");
-                        serverSendMessage(clientSocket, "ERROR_CMD Invalid SEND_PRIVATE. Usage: SEND_PRIVATE <recipient> <message>");
+                        serverSendMessage(clientSocket, "ERROR_CMD Invalid SEND_PRIVATE format.");
                     }
-                    else if (recipient == currentUsername) {
-                        LOG_MSG(clientSocket, "SEND_PRIVATE: User trying to send message to themselves.");
+                    else if (recipient == currentUsername_local) {
                         serverSendMessage(clientSocket, "ERROR_SEND Cannot send message to yourself.");
                     }
+                    else if (!userExists(clientSocket, recipient)) {
+                        serverSendMessage(clientSocket, "ERROR_SEND Recipient '" + recipient + "' does not exist.");
+                    }
                     else {
-                        LOG_MSG(clientSocket, "SEND_PRIVATE: Calling userExists for recipient '" + recipient + "'.");
-                        if (!userExists(clientSocket, recipient)) {
-                            LOG_MSG(clientSocket, "SEND_PRIVATE: Recipient '" + recipient + "' does not exist.");
-                            serverSendMessage(clientSocket, "ERROR_SEND Recipient '" + recipient + "' does not exist.");
+                        std::string chatFile = getChatFilename(currentUsername_local, recipient);
+                        std::string timestamp = getCurrentTimestamp();
+                        std::string formatted_log_message = timestamp + ":" + currentUsername_local + ":" + message_content;
+
+                        std::ofstream chat_log_file(chatFile, std::ios::app);
+                        if (chat_log_file.is_open()) {
+                            chat_log_file << formatted_log_message << std::endl;
+                            chat_log_file.close();
+                            LOG_MSG(clientSocket, "SEND_PRIVATE: Message saved to chat log: " + chatFile);
+
+                            SocketType recipientSocket = INVALID_SOCKET_VALUE;
+                            {
+                                std::lock_guard<std::mutex> lock(G_usersMutex);
+                                auto it = G_connectedUsers.find(recipient);
+                                if (it != G_connectedUsers.end()) {
+                                    recipientSocket = it->second;
+                                }
+                            }
+
+                            if (recipientSocket != INVALID_SOCKET_VALUE) {
+                                std::string fullMessage_to_recipient = "MSG_FROM " + currentUsername_local + ": " + message_content;
+                                serverSendMessage(recipientSocket, fullMessage_to_recipient);
+                            }
+                            serverSendMessage(clientSocket, "OK_SENT Message to " + recipient + " processed.");
+
                         }
                         else {
-                            std::string chatFile = getChatFilename(currentUsername, recipient);
-                            std::string timestamp = getCurrentTimestamp();
-                            std::string formatted_log_message = timestamp + ":" + currentUsername + ":" + message_content;
-
-                            std::ofstream chat_log_file(chatFile, std::ios::app);
-                            if (chat_log_file.is_open()) {
-                                chat_log_file << formatted_log_message << std::endl;
-                                chat_log_file.close();
-                                LOG_MSG(clientSocket, "SEND_PRIVATE: Message saved to chat log: " + chatFile);
-
-                                SocketType recipientSocket = INVALID_SOCKET_VALUE;
-                                {
-                                    std::lock_guard<std::mutex> lock(G_usersMutex);
-                                    auto it = G_connectedUsers.find(recipient);
-                                    if (it != G_connectedUsers.end()) {
-                                        recipientSocket = it->second;
-                                    }
-                                }
-
-                                if (recipientSocket != INVALID_SOCKET_VALUE) {
-                                    std::string fullMessage_to_recipient = "MSG_FROM " + currentUsername + ": " + message_content;
-                                    serverSendMessage(recipientSocket, fullMessage_to_recipient);
-                                    LOG_MSG(clientSocket, "SEND_PRIVATE: Message delivered online to '" + recipient + "'.");
-                                }
-                                else {
-                                    LOG_MSG(clientSocket, "SEND_PRIVATE: Recipient '" + recipient + "' is offline. Message saved.");
-                                }
-                                serverSendMessage(clientSocket, "OK_SENT Message to " + recipient + " processed.");
-
-                            }
-                            else {
-                                LOG_MSG(clientSocket, "SEND_PRIVATE: CRITICAL - Failed to open chat log file '" + chatFile + "' for writing!");
-                                serverSendMessage(clientSocket, "ERROR_SEND Server error, message not saved.");
-                            }
+                            LOG_SERVER_MSG("SEND_PRIVATE: CRITICAL - Failed to open chat log file '" + chatFile + "' for writing!");
+                            serverSendMessage(clientSocket, "ERROR_SEND Server error, message not saved.");
                         }
                     }
                 }
                 else if (cmd_token_upper == "GET_HISTORY") {
-                    std::string otherUsername;
-                    iss >> otherUsername;
-                    LOG_MSG(clientSocket, "GET_HISTORY request for chat with '" + otherUsername + "' from user '" + currentUsername + "'.");
-
-                    if (otherUsername.empty()) {
-                        serverSendMessage(clientSocket, "ERROR_CMD Invalid GET_HISTORY format. Usage: GET_HISTORY <username>");
-                    }
-                    else if (otherUsername == currentUsername) {
-                        serverSendMessage(clientSocket, "NO_HISTORY You cannot request history with yourself in this manner."); // Или ERROR_CMD
-                    }
-                    else if (!userExists(clientSocket, otherUsername)) {
-                        serverSendMessage(clientSocket, "ERROR_CMD User '" + otherUsername + "' does not exist for history request.");
-                    }
+                    std::string partner_username;
+                    iss >> partner_username;
+                    if (partner_username.empty()) { serverSendMessage(clientSocket, "ERROR_CMD Invalid GET_HISTORY: missing username."); }
+                    else if (partner_username == currentUsername_local) { serverSendMessage(clientSocket, "NO_HISTORY " + partner_username); }
+                    else if (!userExists(clientSocket, partner_username)) { serverSendMessage(clientSocket, "ERROR_CMD User '" + partner_username + "' does not exist for history request."); }
                     else {
-                        std::string chatFile = getChatFilename(currentUsername, otherUsername);
-                        std::ifstream historyFile(chatFile);
-
-                        if (historyFile.is_open()) {
-                            serverSendMessage(clientSocket, "HISTORY_START " + otherUsername);
-                            LOG_MSG(clientSocket, "Sending history for chat with '" + otherUsername + "' to '" + currentUsername + "'.");
-                            std::string history_line;
-                            int line_count = 0;
-                            while (std::getline(historyFile, history_line)) {
-                                serverSendMessage(clientSocket, "HIST_MSG " + history_line);
-                                line_count++;
+                        std::string chat_file = getChatFilename(currentUsername_local, partner_username);
+                        std::vector<std::string> history_entries;
+                        std::ifstream history_ifs(chat_file);
+                        if (history_ifs.is_open()) {
+                            std::string line;
+                            while (std::getline(history_ifs, line)) {
+                                if (!line.empty()) history_entries.push_back(line);
                             }
-                            historyFile.close();
-                            serverSendMessage(clientSocket, "HISTORY_END " + otherUsername);
-                            LOG_MSG(clientSocket, "Finished sending " + std::to_string(line_count) + " history lines for chat with '" + otherUsername + "'.");
+                            history_ifs.close(); // Закрываем файл после чтения
+                        }
+
+                        if (!history_entries.empty()) {
+                            serverSendMessage(clientSocket, "HISTORY_START " + partner_username);
+                            for (const std::string& entry : history_entries) {
+                                serverSendMessage(clientSocket, "HIST_MSG " + entry);
+                            }
+                            serverSendMessage(clientSocket, "HISTORY_END " + partner_username);
                         }
                         else {
-                            LOG_MSG(clientSocket, "No history file found for chat between '" + currentUsername + "' and '" + otherUsername + "'. File: " + chatFile);
-                            serverSendMessage(clientSocket, "NO_HISTORY " + otherUsername);
+                            serverSendMessage(clientSocket, "NO_HISTORY " + partner_username);
                         }
                     }
                 }
-                else if (cmd_token_upper == "LOGOUT") {
-                    LOG_MSG(clientSocket, "LOGOUT command received for user '" + currentUsername + "'.");
-                    serverSendMessage(clientSocket, "OK_LOGOUT Goodbye, " + currentUsername + "!");
-                    loggedIn = false;
-                    // Не удаляем из G_connectedUsers здесь, это произойдет при закрытии сокета или в cleanup ниже
-                    break; // Завершаем цикл обработки команд для этого клиента
+                else if (cmd_token_upper == "GET_CHAT_PARTNERS") {
+                    LOG_MSG(clientSocket, "GET_CHAT_PARTNERS request from " + currentUsername_local);
+                    std::vector<std::pair<std::string, std::string>> chatPartnersStatus;
+                    std::set<std::string> foundPartners;
+
+                    try {
+                        for (const auto& entry : std::filesystem::directory_iterator(G_chatLogsDir)) {
+                            if (entry.is_regular_file()) {
+                                std::string filename = entry.path().filename().string();
+                                if (filename.rfind("chat_", 0) == 0 && filename.rfind(".txt") == filename.length() - 4) {
+                                    std::string users_part = filename.substr(5, filename.length() - 9);
+                                    size_t underscore_pos = users_part.find('_');
+                                    if (underscore_pos != std::string::npos) {
+                                        std::string user1 = users_part.substr(0, underscore_pos);
+                                        std::string user2 = users_part.substr(underscore_pos + 1);
+                                        std::string partner;
+
+                                        if (user1 == currentUsername_local) partner = user2;
+                                        else if (user2 == currentUsername_local) partner = user1;
+                                        else continue;
+
+                                        if (foundPartners.find(partner) == foundPartners.end()) {
+                                            std::string status = "offline";
+                                            {
+                                                std::lock_guard<std::mutex> users_lock(G_usersMutex);
+                                                if (G_connectedUsers.count(partner)) {
+                                                    status = "online";
+                                                }
+                                            }
+                                            chatPartnersStatus.push_back({ partner, status });
+                                            foundPartners.insert(partner);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    catch (const std::filesystem::filesystem_error& fs_err) {
+                        LOG_SERVER_MSG("Filesystem error in GET_CHAT_PARTNERS: " + std::string(fs_err.what()));
+                        serverSendMessage(clientSocket, "ERROR_SERVER_FS_ERROR");
+                        continue;
+                    }
+
+                    if (!chatPartnersStatus.empty()) {
+                        serverSendMessage(clientSocket, "FRIEND_LIST_START");
+                        for (const auto& partner_status : chatPartnersStatus) {
+                            serverSendMessage(clientSocket, "FRIEND " + partner_status.first + " " + partner_status.second);
+                        }
+                        serverSendMessage(clientSocket, "FRIEND_LIST_END");
+                    }
+                    else {
+                        serverSendMessage(clientSocket, "NO_FRIENDS_FOUND");
+                    }
                 }
                 else {
-                    std::string rest_of_command;
-                    std::getline(iss, rest_of_command);
-                    LOG_MSG(clientSocket, "Invalid command '" + cmd_token_from_client + rest_of_command + "' received while logged in.");
-                    serverSendMessage(clientSocket, "ERROR_CMD Invalid command. Available: SEND_PRIVATE, GET_HISTORY, HELP, EXIT (acts as LOGOUT)");
+                    serverSendMessage(clientSocket, "ERROR_CMD Unknown command when logged in.");
                 }
             }
-            LOG_MSG(clientSocket, "End of command processing loop iteration.");
         }
     }
     catch (const std::exception& e) {
-        LOG_MSG(clientSocket, "Exception in handleClient for user '" + (currentUsername.empty() ? "[unidentified]" : currentUsername) + "': " + e.what());
+        LOG_MSG(clientSocket, "Exception in handleClient for user '" + (currentUsername_local.empty() ? "[unidentified]" : currentUsername_local) + "': " + e.what());
     }
     catch (...) {
-        LOG_MSG(clientSocket, "Unknown exception in handleClient for user '" + (currentUsername.empty() ? "[unidentified]" : currentUsername) + "'");
+        LOG_MSG(clientSocket, "Unknown exception in handleClient for user '" + (currentUsername_local.empty() ? "[unidentified]" : currentUsername_local) + "'");
     }
 
-    if (!currentUsername.empty()) {
-        LOG_MSG(clientSocket, "Cleaning up connection for user '" + currentUsername + "'. Acquiring G_usersMutex.");
+    if (!currentUsername_local.empty() && loggedIn_local) {
         std::lock_guard<std::mutex> lock(G_usersMutex);
-        // LOG_MSG(clientSocket, "Acquired G_usersMutex for cleanup of '" + currentUsername + "'.");
-        auto it = G_connectedUsers.find(currentUsername);
-        if (it != G_connectedUsers.end() && it->second == clientSocket) { // Важно! Удаляем только если сокет совпадает
+        auto it = G_connectedUsers.find(currentUsername_local);
+        if (it != G_connectedUsers.end() && it->second == clientSocket) {
             G_connectedUsers.erase(it);
-            LOG_MSG(clientSocket, "User '" + currentUsername + "' connection data cleaned up from G_connectedUsers.");
+            LOG_MSG(clientSocket, "User '" + currentUsername_local + "' removed from connected users due to connection drop/error.");
             { std::lock_guard<std::mutex> log_lock(G_logMutex); logConnectedUsersInternal(); }
         }
-        else {
-            // LOG_MSG(clientSocket, "User '" + currentUsername + "' not found in connected users or socket mismatch during cleanup.");
-        }
-        // LOG_MSG(clientSocket, "Releasing G_usersMutex for cleanup of '" + currentUsername + "'.");
     }
     LOG_MSG(clientSocket, "Closing connection.");
     CLOSE_SOCKET(clientSocket);
@@ -566,7 +578,7 @@ int main() {
         return 1;
     }
 
-    LOG_SERVER_MSG("Server listening on port 8081 (using file-based user store)...");
+    LOG_SERVER_MSG("Server listening on port 8081 (with GET_CHAT_PARTNERS support, corrected logout)...");
 
     while (true) {
         sockaddr_in clientAddr;
@@ -579,19 +591,29 @@ int main() {
 
         if (clientSocket == INVALID_SOCKET_VALUE) {
             int error_code = GET_LAST_ERROR;
-            std::string error_str = GET_LAST_ERROR_STR;
 #ifdef _WIN32
-            if (error_code == WSAEINTR || error_code == WSAENOTSOCK) {
-                LOG_SERVER_MSG("accept interrupted (WSAEINTR/WSAENOTSOCK), server likely shutting down.");
-                break;
+            if (error_code == WSAEINTR || error_code == WSAENOTSOCK || error_code == WSAECONNABORTED) {
+                LOG_SERVER_MSG("accept likely interrupted or client closed. Error: " + std::to_string(error_code));
+                if (error_code == WSAENOTSOCK) {
+                    LOG_SERVER_MSG("Server socket no longer valid, attempting to shutdown server.");
+                    break;
+                }
             }
-#else
-            if (error_code == EINTR || error_code == EBADF) {
-                LOG_SERVER_MSG("accept interrupted (EINTR/EBADF), server likely shutting down.");
-                break;
+            else {
+                LOG_SERVER_MSG("Accept failed with error: " + std::to_string(error_code) + ". Continuing...");
+            }
+#else 
+            if (error_code == EINTR || error_code == EBADF || error_code == ECONNABORTED) {
+                LOG_SERVER_MSG("accept likely interrupted or client closed. Error: " + std::to_string(error_code));
+                if (error_code == EBADF) {
+                    LOG_SERVER_MSG("Server socket no longer valid, attempting to shutdown server.");
+                    break;
+                }
+            }
+            else {
+                LOG_SERVER_MSG("Accept failed with error: " + std::to_string(error_code) + ". Continuing...");
             }
 #endif
-            LOG_SERVER_MSG("Accept failed with error: " + std::to_string(error_code) + "(" + error_str + "). Continuing...");
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
         }
@@ -615,7 +637,7 @@ int main() {
         }
     }
 
-    LOG_SERVER_MSG("Server shutting down.");
+    LOG_SERVER_MSG("Server shutting down loop.");
     CLOSE_SOCKET(serverSocket);
     shutdownUserStore();
 #ifdef _WIN32
